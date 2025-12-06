@@ -38,10 +38,21 @@ static int prev_octave = 0;
 static float prev_cents = 0;
 static float prev_display_freq = 0;
 static int no_signal_count = 0;
+static bool display_initialized = false;
 
 // Waveform display buffer
 static int16_t waveform_buffer[SAMPLE_SIZE];
 static bool waveform_updated = false;
+
+// Reference frequency (A4)
+static float reference_freq = 440.0f;  // Hz, standard A4
+static const float FREQ_STEP = 1.0f;   // 1 Hz step for reference
+
+// Progress bar state tracking to prevent unnecessary redraws
+static float prev_display_rms = 0;
+static int prev_fillWidth = 0;
+static uint16_t prev_barColor = 0;
+static int prev_indicatorX = 0;
 
 // Note frequency table (A4 = 440Hz standard tuning)
 // Covers guitar range from E2 (82.41Hz) to E6 (1318.51Hz)
@@ -165,8 +176,8 @@ float findDominantFrequency(int16_t* samples, int numSamples) {
         }
     }
 
-    // Balanced threshold optimized for guitar
-    float minThreshold = (20.0f > noise_floor * 1.3f) ? 20.0f : noise_floor * 1.3f;
+        // More conservative threshold for stability
+    float minThreshold = (30.0f > noise_floor * 1.5f) ? 30.0f : noise_floor * 1.5f;
     if (rms < minThreshold) {
         return 0;
     }
@@ -228,8 +239,8 @@ float findDominantFrequency(int16_t* samples, int numSamples) {
         }
     }
 
-    // Balanced peak threshold for guitar tuning
-    if (peakValue < 4.0) {
+    // Higher peak threshold for stability
+    if (peakValue < 6.0) {
         return 0;
     }
 
@@ -239,10 +250,10 @@ float findDominantFrequency(int16_t* samples, int numSamples) {
     // Convert bin to frequency with interpolation
     float frequency = refinedIndex * SAMPLE_RATE / FFT_SIZE;
 
-    // Balanced smoothing optimized for guitar strings
-    if (prev_frequency > 0 && abs(frequency - prev_frequency) < 20) {
-        // Moderate smoothing - quick response but stable
-        float smoothFactor = (abs(frequency - prev_frequency) < 2) ? 0.75 : 0.55;
+    // Very strong smoothing for maximum stability
+    if (prev_frequency > 0 && abs(frequency - prev_frequency) < 12) {
+        // Extra heavy smoothing - maximize stability
+        float smoothFactor = (abs(frequency - prev_frequency) < 1) ? 0.90 : 0.80;
         frequency = smoothFactor * frequency + (1 - smoothFactor) * prev_frequency;
         stable_count++;
     } else {
@@ -250,8 +261,8 @@ float findDominantFrequency(int16_t* samples, int numSamples) {
     }
     prev_frequency = frequency;
 
-    // Moderate stability requirement
-    if (stable_count < 2) {
+    // Require significant stability before accepting
+    if (stable_count < 6) {
         return prev_frequency > 0 ? prev_frequency : 0;
     }
 
@@ -271,7 +282,9 @@ void findClosestNote(float frequency, char* noteName, int* octave, float* cents)
     int closestIndex = 0;
 
     for (int i = 0; i < NUM_NOTES; i++) {
-        float diff = abs(frequency - NOTE_FREQUENCIES[i]);
+        // Scale frequency based on reference A4
+        float adjustedTargetFreq = NOTE_FREQUENCIES[i] * (reference_freq / 440.0f);
+        float diff = abs(frequency - adjustedTargetFreq);
         if (diff < minDiff) {
             minDiff = diff;
             closestIndex = i;
@@ -284,88 +297,121 @@ void findClosestNote(float frequency, char* noteName, int* octave, float* cents)
     strcpy(noteName, NOTE_NAMES[noteIndex]);
 
     // Calculate cents (100 cents = 1 semitone)
-    float targetFreq = NOTE_FREQUENCIES[closestIndex];
+    float targetFreq = NOTE_FREQUENCIES[closestIndex] * (reference_freq / 440.0f);
     *cents = 1200 * log2(frequency / targetFreq);
 }
 
-// Draw real-time waveform
-void drawWaveform(const char* noteName, float cents) {
-    // Waveform display area
-    int waveY = 95;
-    int waveHeight = 35;
-    int waveWidth = DISPLAY_WIDTH - 20;
-    int waveX = 10;
+// Draw tuning progress bar (with smart dirty region detection)
+void drawTuningBar(const char* noteName, float cents, float rms, bool fullRedraw) {
+    // Progress bar display area
+    int barY = 95;
+    int barHeight = 35;
+    int barWidth = DISPLAY_WIDTH - 20;
+    int barX = 10;
 
-    // Draw waveform background
-    M5Cardputer.Display.fillRect(waveX, waveY, waveWidth, waveHeight, TFT_BLACK);
-    M5Cardputer.Display.drawRect(waveX, waveY, waveWidth, waveHeight, TFT_DARKGREY);
-
-    // Draw center line
-    int centerY = waveY + waveHeight / 2;
-    M5Cardputer.Display.drawFastHLine(waveX, centerY, waveWidth, TFT_DARKGREY);
-
-    if (!waveform_updated) {
+    // Safety check
+    if (noteName == nullptr || barWidth <= 0) {
         return;
     }
 
-    // Determine waveform color based on tuning status
-    uint16_t waveColor;
-    if (strcmp(noteName, "--") == 0) {
-        waveColor = TFT_DARKGREY;
-    } else if (abs(cents) < 5) {
-        waveColor = TFT_GREEN;  // In tune
-    } else if (abs(cents) < 15) {
-        waveColor = TFT_YELLOW; // Close
+    // If no signal, show empty bar (once)
+    if (strcmp(noteName, "--") == 0 || !waveform_updated) {
+        if (!fullRedraw) return;  // Don't redraw empty bar repeatedly
+        M5Cardputer.Display.fillRect(barX, barY, barWidth, barHeight, TFT_BLACK);
+        M5Cardputer.Display.drawRect(barX, barY, barWidth, barHeight, TFT_DARKGREY);
+        int centerX = barX + barWidth / 2;
+        M5Cardputer.Display.drawFastVLine(centerX, barY, barHeight, TFT_DARKGREY);
+        return;
+    }
+
+    // Smooth RMS to prevent jitter
+    if (prev_display_rms == 0) {
+        prev_display_rms = rms;
     } else {
-        waveColor = TFT_RED;    // Out of tune
+        prev_display_rms = 0.85 * prev_display_rms + 0.15 * rms;
     }
 
-    // Find max amplitude for scaling
-    int16_t maxAmp = 1;
-    for (int i = 0; i < SAMPLE_SIZE; i++) {
-        int16_t amp = abs(waveform_buffer[i]);
-        if (amp > maxAmp) {
-            maxAmp = amp;
+    // Normalize RMS to 0-1 range
+    float normalizedRMS = prev_display_rms / 500.0f;
+    normalizedRMS = constrain(normalizedRMS, 0.0f, 1.0f);
+
+    // Determine bar color based on tuning accuracy
+    uint16_t barColor;
+    if (abs(cents) < 5) {
+        barColor = TFT_GREEN;
+    } else if (abs(cents) < 15) {
+        barColor = TFT_YELLOW;
+    } else if (abs(cents) < 30) {
+        barColor = TFT_ORANGE;
+    } else {
+        barColor = TFT_RED;
+    }
+
+    // Calculate fill width and indicator position
+    int fillWidth = (int)(normalizedRMS * barWidth * 0.8);
+    fillWidth = constrain(fillWidth, 10, barWidth - 10);
+
+    float clampedCents = constrain(cents, -50, 50);
+    float position = 0.5 + (clampedCents / 100.0);
+    position = constrain(position, 0.0f, 1.0f);
+    int indicatorX = barX + (int)(position * barWidth);
+
+    // Smart dirty region detection - only redraw if changed significantly
+    bool needsRedraw = fullRedraw;
+    if (!fullRedraw) {
+        // Check if any visual element changed significantly
+        if (abs(fillWidth - prev_fillWidth) > 3 ||        // Width changed >3px
+            barColor != prev_barColor ||                   // Color changed
+            abs(indicatorX - prev_indicatorX) > 2) {      // Indicator moved >2px
+            needsRedraw = true;
         }
     }
 
-    // Downsample for display (show every N samples to fit width)
-    int samplesPerPixel = SAMPLE_SIZE / waveWidth;
-    if (samplesPerPixel < 1) samplesPerPixel = 1;
-
-    // Draw waveform
-    int prevX = waveX;
-    int prevY = centerY;
-
-    for (int x = 0; x < waveWidth; x++) {
-        int sampleIdx = x * samplesPerPixel;
-        if (sampleIdx >= SAMPLE_SIZE) break;
-
-        // Average samples for this pixel
-        float avgSample = 0;
-        int count = 0;
-        for (int i = 0; i < samplesPerPixel && (sampleIdx + i) < SAMPLE_SIZE; i++) {
-            avgSample += waveform_buffer[sampleIdx + i];
-            count++;
-        }
-        if (count > 0) {
-            avgSample /= count;
-        }
-
-        // Scale to display height
-        int y = centerY - (int)((avgSample * (waveHeight / 2 - 2)) / maxAmp);
-        y = constrain(y, waveY + 1, waveY + waveHeight - 2);
-
-        // Draw line from previous point
-        M5Cardputer.Display.drawLine(prevX, prevY, waveX + x, y, waveColor);
-
-        prevX = waveX + x;
-        prevY = y;
+    // Skip redraw if nothing changed
+    if (!needsRedraw) {
+        return;
     }
+
+    // Store current state
+    prev_fillWidth = fillWidth;
+    prev_barColor = barColor;
+    prev_indicatorX = indicatorX;
+
+    // Clear and redraw
+    if (fullRedraw) {
+        M5Cardputer.Display.fillRect(barX, barY, barWidth, barHeight, TFT_BLACK);
+        M5Cardputer.Display.drawRect(barX, barY, barWidth, barHeight, TFT_DARKGREY);
+    } else {
+        M5Cardputer.Display.fillRect(barX + 1, barY + 1, barWidth - 2, barHeight - 2, TFT_BLACK);
+    }
+
+    // Draw center line
+    int centerX = barX + barWidth / 2;
+    M5Cardputer.Display.drawFastVLine(centerX, barY, barHeight, TFT_DARKGREY);
+
+    // Draw tick marks
+    for (int i = -3; i <= 3; i++) {
+        if (i == 0) continue;
+        int tickX = centerX + (i * barWidth / 8);
+        M5Cardputer.Display.drawFastVLine(tickX, barY + barHeight - 5, 5, TFT_DARKGREY);
+    }
+
+    // Draw filled bar from left to right
+    int fillHeight = barHeight - 4;
+    int fillY = barY + 2;
+    int barStartX = barX + 2;
+
+    M5Cardputer.Display.fillRect(barStartX, fillY, fillWidth, fillHeight, barColor);
+    M5Cardputer.Display.drawFastHLine(barStartX, fillY, fillWidth, TFT_WHITE);
+
+    // Draw indicator line
+    M5Cardputer.Display.drawFastVLine(indicatorX, barY + 1, barHeight - 2, TFT_WHITE);
+    M5Cardputer.Display.drawFastVLine(indicatorX - 1, barY + 1, barHeight - 2, TFT_WHITE);
+    M5Cardputer.Display.drawFastVLine(indicatorX + 1, barY + 1, barHeight - 2, TFT_WHITE);
 }
 
 // Draw the tuner display with reduced flicker
-void drawTuner(const char* noteName, int octave, float cents, float frequency) {
+void drawTuner(const char* noteName, int octave, float cents, float frequency, float rms) {
     // Check if we have no signal
     bool hasSignal = (strcmp(noteName, "--") != 0);
 
@@ -376,7 +422,7 @@ void drawTuner(const char* noteName, int octave, float cents, float frequency) {
         no_signal_count = 0;
     }
 
-    // Only update display if values changed significantly or transitioning to/from no signal
+    // Only update display if values changed significantly
     bool shouldUpdate = false;
 
     if (!hasSignal && no_signal_count == 1) {
@@ -386,17 +432,24 @@ void drawTuner(const char* noteName, int octave, float cents, float frequency) {
         // Just got signal
         shouldUpdate = true;
     } else if (hasSignal) {
-        // Check if note or frequency changed significantly
+        // Check if note or frequency changed significantly - extremely conservative
         if (strcmp(noteName, prev_noteName) != 0 ||
-            octave != prev_octave ||
-            abs(cents - prev_cents) > 1.0 ||
-            abs(frequency - prev_display_freq) > 0.8) {
+            octave != prev_octave) {
+            shouldUpdate = true;
+        }
+        // Only update for very large frequency changes
+        else if (abs(cents - prev_cents) > 8.0 ||
+                 abs(frequency - prev_display_freq) > 5.0) {
             shouldUpdate = true;
         }
     }
 
-    // Update only when needed
+    // Only update text area when needed, selectively update progress bar
     if (!shouldUpdate && no_signal_count < 2) {
+        // Update progress bar only when there's signal
+        if (hasSignal) {
+            drawTuningBar(noteName, cents, rms, false);
+        }
         return;
     }
 
@@ -406,7 +459,22 @@ void drawTuner(const char* noteName, int octave, float cents, float frequency) {
     prev_cents = cents;
     prev_display_freq = frequency;
 
-    M5Cardputer.Display.fillScreen(TFT_BLACK);
+    // On first display or when switching between signal states, clear once
+    if (!display_initialized) {
+        M5Cardputer.Display.fillScreen(TFT_BLACK);
+        display_initialized = true;
+        // Also reset progress bar tracking on initialization
+        prev_fillWidth = 0;
+        prev_barColor = 0;
+        prev_indicatorX = 0;
+        prev_display_rms = 0;
+    } else {
+        // Only clear specific text areas to minimize flicker
+        // Clear note name area
+        M5Cardputer.Display.fillRect(0, 10, DISPLAY_WIDTH, 50, TFT_BLACK);
+        // Clear frequency area
+        M5Cardputer.Display.fillRect(0, 50, DISPLAY_WIDTH, 40, TFT_BLACK);
+    }
 
     // Draw note name and octave (larger and centered)
     M5Cardputer.Display.setTextSize(5);
@@ -419,43 +487,35 @@ void drawTuner(const char* noteName, int octave, float cents, float frequency) {
         M5Cardputer.Display.drawString(noteStr, CENTER_X, 30);
     }
 
-    // Draw frequency with higher precision
+    // Draw reference frequency (A4) - always visible
+    M5Cardputer.Display.setTextSize(1);
+    M5Cardputer.Display.setTextColor(TFT_CYAN);
+    M5Cardputer.Display.drawString("A4=" + String(reference_freq, 1) + "Hz", CENTER_X, 55);
+
+    // Draw target frequency for current note
+    if (strcmp(noteName, "--") != 0) {
+        M5Cardputer.Display.setTextColor(TFT_DARKGREY);
+        float targetFreq = NOTE_FREQUENCIES[(octave - 2) * 12 + (strchr(NOTE_NAMES[0], noteName[0]) - NOTE_NAMES[0])];
+        for (int i = 0; i < NUM_NOTES; i++) {
+            if (strcmp(noteName, NOTE_NAMES[i % 12]) == 0 && octave == (i / 12) + 2) {
+                targetFreq = NOTE_FREQUENCIES[i];
+                break;
+            }
+        }
+        targetFreq *= (reference_freq / 440.0f);
+        M5Cardputer.Display.drawString("Target: " + String(targetFreq, 1) + " Hz", CENTER_X, 63);
+    }
+
     M5Cardputer.Display.setTextSize(2);
     M5Cardputer.Display.setTextColor(TFT_YELLOW);
     if (frequency > 0) {
-        M5Cardputer.Display.drawString(String(frequency, 1) + " Hz", CENTER_X, 60);
+        M5Cardputer.Display.drawString(String(frequency, 1) + " Hz", CENTER_X, 78);
     } else {
-        M5Cardputer.Display.drawString("--- Hz", CENTER_X, 60);
+        M5Cardputer.Display.drawString("--- Hz", CENTER_X, 78);
     }
 
-    // Draw cents offset for precise tuning
-    M5Cardputer.Display.setTextSize(1);
-    if (strcmp(noteName, "--") != 0) {
-        M5Cardputer.Display.setTextColor(TFT_CYAN);
-        String centsStr = (cents >= 0 ? "+" : "") + String(cents, 1) + " cents";
-        M5Cardputer.Display.drawString(centsStr, CENTER_X, 85);
-    }
-
-    // Draw status text
-    M5Cardputer.Display.setTextSize(1);
-    if (strcmp(noteName, "--") == 0) {
-        M5Cardputer.Display.setTextColor(TFT_DARKGREY);
-        M5Cardputer.Display.drawString("Play a note...", CENTER_X, 120);
-    } else {
-        if (abs(cents) < 5) {
-            M5Cardputer.Display.setTextColor(TFT_GREEN);
-            M5Cardputer.Display.drawString("IN TUNE!", CENTER_X, 120);
-        } else if (cents > 0) {
-            M5Cardputer.Display.setTextColor(TFT_RED);
-            M5Cardputer.Display.drawString("Too Sharp", CENTER_X, 120);
-        } else {
-            M5Cardputer.Display.setTextColor(TFT_RED);
-            M5Cardputer.Display.drawString("Too Flat", CENTER_X, 120);
-        }
-    }
-
-    // Draw real-time waveform
-    drawWaveform(noteName, cents);
+    // Draw tuning progress bar (status is shown by bar color, no text needed)
+    drawTuningBar(noteName, cents, rms, true);
 }
 
 void setup() {
@@ -493,6 +553,31 @@ void setup() {
 void loop() {
     M5Cardputer.update();
 
+    // Check for key presses to adjust frequency offset
+    if (M5Cardputer.Keyboard.isChange()) {
+        if (M5Cardputer.Keyboard.isPressed()) {
+            Keyboard_Class::KeysState status = M5Cardputer.Keyboard.keysState();
+
+            // Check for arrow keys (using KEY modifier)
+            for (auto i : status.word) {
+                if (i == ';') {  // Arrow up: increase reference frequency
+                    reference_freq += FREQ_STEP;
+                    if (reference_freq > 450.0f) reference_freq = 450.0f;  // Limit to 450Hz
+                    // Force display update
+                    prev_noteName[0] = '\0';
+                    display_initialized = false;
+                }
+                else if (i == '.') {  // Arrow down: decrease reference frequency
+                    reference_freq -= FREQ_STEP;
+                    if (reference_freq < 430.0f) reference_freq = 430.0f;  // Limit to 430Hz
+                    // Force display update
+                    prev_noteName[0] = '\0';
+                    display_initialized = false;
+                }
+            }
+        }
+    }
+
     // Record audio samples
     if (M5Cardputer.Mic.isEnabled()) {
         if (M5Cardputer.Mic.record(audio_buffer, SAMPLE_SIZE, SAMPLE_RATE)) {
@@ -500,17 +585,24 @@ void loop() {
             memcpy(waveform_buffer, audio_buffer, sizeof(audio_buffer));
             waveform_updated = true;
 
+            // Calculate RMS once for the entire loop
+            float rms = 0;
+            for (int i = 0; i < SAMPLE_SIZE; i++) {
+                rms += (float)waveform_buffer[i] * waveform_buffer[i];
+            }
+            rms = sqrt(rms / SAMPLE_SIZE);
+
             // Find dominant frequency
             float frequency = findDominantFrequency(audio_buffer, SAMPLE_SIZE);
 
             // Find closest note
-            char noteName[4];
-            int octave;
-            float cents;
+            char noteName[4] = "--";  // Initialize to prevent undefined behavior
+            int octave = 0;
+            float cents = 0;
             findClosestNote(frequency, noteName, &octave, &cents);
 
             // Draw tuner display
-            drawTuner(noteName, octave, cents, frequency);
+            drawTuner(noteName, octave, cents, frequency, rms);
         }
     }
 
