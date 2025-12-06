@@ -39,6 +39,10 @@ static float prev_cents = 0;
 static float prev_display_freq = 0;
 static int no_signal_count = 0;
 
+// Waveform display buffer
+static int16_t waveform_buffer[SAMPLE_SIZE];
+static bool waveform_updated = false;
+
 // Note frequency table (A4 = 440Hz standard tuning)
 // Covers guitar range from E2 (82.41Hz) to E6 (1318.51Hz)
 const char* NOTE_NAMES[] = {"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"};
@@ -284,6 +288,82 @@ void findClosestNote(float frequency, char* noteName, int* octave, float* cents)
     *cents = 1200 * log2(frequency / targetFreq);
 }
 
+// Draw real-time waveform
+void drawWaveform(const char* noteName, float cents) {
+    // Waveform display area
+    int waveY = 95;
+    int waveHeight = 35;
+    int waveWidth = DISPLAY_WIDTH - 20;
+    int waveX = 10;
+
+    // Draw waveform background
+    M5Cardputer.Display.fillRect(waveX, waveY, waveWidth, waveHeight, TFT_BLACK);
+    M5Cardputer.Display.drawRect(waveX, waveY, waveWidth, waveHeight, TFT_DARKGREY);
+
+    // Draw center line
+    int centerY = waveY + waveHeight / 2;
+    M5Cardputer.Display.drawFastHLine(waveX, centerY, waveWidth, TFT_DARKGREY);
+
+    if (!waveform_updated) {
+        return;
+    }
+
+    // Determine waveform color based on tuning status
+    uint16_t waveColor;
+    if (strcmp(noteName, "--") == 0) {
+        waveColor = TFT_DARKGREY;
+    } else if (abs(cents) < 5) {
+        waveColor = TFT_GREEN;  // In tune
+    } else if (abs(cents) < 15) {
+        waveColor = TFT_YELLOW; // Close
+    } else {
+        waveColor = TFT_RED;    // Out of tune
+    }
+
+    // Find max amplitude for scaling
+    int16_t maxAmp = 1;
+    for (int i = 0; i < SAMPLE_SIZE; i++) {
+        int16_t amp = abs(waveform_buffer[i]);
+        if (amp > maxAmp) {
+            maxAmp = amp;
+        }
+    }
+
+    // Downsample for display (show every N samples to fit width)
+    int samplesPerPixel = SAMPLE_SIZE / waveWidth;
+    if (samplesPerPixel < 1) samplesPerPixel = 1;
+
+    // Draw waveform
+    int prevX = waveX;
+    int prevY = centerY;
+
+    for (int x = 0; x < waveWidth; x++) {
+        int sampleIdx = x * samplesPerPixel;
+        if (sampleIdx >= SAMPLE_SIZE) break;
+
+        // Average samples for this pixel
+        float avgSample = 0;
+        int count = 0;
+        for (int i = 0; i < samplesPerPixel && (sampleIdx + i) < SAMPLE_SIZE; i++) {
+            avgSample += waveform_buffer[sampleIdx + i];
+            count++;
+        }
+        if (count > 0) {
+            avgSample /= count;
+        }
+
+        // Scale to display height
+        int y = centerY - (int)((avgSample * (waveHeight / 2 - 2)) / maxAmp);
+        y = constrain(y, waveY + 1, waveY + waveHeight - 2);
+
+        // Draw line from previous point
+        M5Cardputer.Display.drawLine(prevX, prevY, waveX + x, y, waveColor);
+
+        prevX = waveX + x;
+        prevY = y;
+    }
+}
+
 // Draw the tuner display with reduced flicker
 void drawTuner(const char* noteName, int octave, float cents, float frequency) {
     // Check if we have no signal
@@ -374,49 +454,8 @@ void drawTuner(const char* noteName, int octave, float cents, float frequency) {
         }
     }
 
-    // Draw tuning meter
-    int meterY = 100;
-    int meterWidth = DISPLAY_WIDTH - 20;
-    int meterHeight = 15;
-    int meterX = 10;
-
-    // Draw meter background
-    M5Cardputer.Display.drawRect(meterX, meterY, meterWidth, meterHeight, TFT_WHITE);
-    M5Cardputer.Display.drawFastVLine(CENTER_X, meterY, meterHeight, TFT_GREEN);
-
-    // Draw tick marks
-    for (int i = -3; i <= 3; i++) {
-        int tickX = CENTER_X + (i * meterWidth / 8);
-        M5Cardputer.Display.drawFastVLine(tickX, meterY + meterHeight - 4, 4, TFT_DARKGREY);
-    }
-
-    // Draw pointer if we have a valid note
-    if (strcmp(noteName, "--") != 0 && cents >= -50 && cents <= 50) {
-        // Clamp cents to display range
-        float clampedCents = constrain(cents, -50, 50);
-        int pointerX = CENTER_X + (int)(clampedCents * meterWidth / 100);
-
-        // Determine color based on tuning accuracy
-        uint16_t pointerColor;
-        if (abs(cents) < 5) {
-            pointerColor = TFT_GREEN;  // In tune
-        } else if (abs(cents) < 15) {
-            pointerColor = TFT_YELLOW; // Close
-        } else {
-            pointerColor = TFT_RED;    // Out of tune
-        }
-
-        // Draw pointer triangle
-        M5Cardputer.Display.fillTriangle(
-            pointerX, meterY - 6,
-            pointerX - 4, meterY,
-            pointerX + 4, meterY,
-            pointerColor
-        );
-
-        // Draw needle
-        M5Cardputer.Display.drawFastVLine(pointerX, meterY, meterHeight, pointerColor);
-    }
+    // Draw real-time waveform
+    drawWaveform(noteName, cents);
 }
 
 void setup() {
@@ -457,6 +496,10 @@ void loop() {
     // Record audio samples
     if (M5Cardputer.Mic.isEnabled()) {
         if (M5Cardputer.Mic.record(audio_buffer, SAMPLE_SIZE, SAMPLE_RATE)) {
+            // Copy waveform data for display
+            memcpy(waveform_buffer, audio_buffer, sizeof(audio_buffer));
+            waveform_updated = true;
+
             // Find dominant frequency
             float frequency = findDominantFrequency(audio_buffer, SAMPLE_SIZE);
 
